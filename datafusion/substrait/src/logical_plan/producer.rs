@@ -23,7 +23,7 @@ use substrait::proto::expression_reference::ExprType;
 
 use datafusion::arrow::datatypes::{Field, IntervalUnit};
 use datafusion::logical_expr::{
-    Distinct, FetchType, Like, Partitioning, SkipType, WindowFrameUnits,
+    Distinct, FetchType, Like, Partitioning, SkipType, Values, WindowFrameUnits,
 };
 use datafusion::{
     arrow::datatypes::{DataType, TimeUnit},
@@ -242,29 +242,49 @@ pub fn to_substrait_rel(
             }))
         }
         LogicalPlan::Values(v) => {
-            let values = v
+            let values = if contains_only_literals(v) {
+                v.values
+                    .iter()
+                    .map(|row| {
+                        let fields = row
+                            .iter()
+                            .map(|v| match v {
+                                Expr::Literal(sv) => to_substrait_literal(sv, extensions),
+                                Expr::Alias(alias) => match alias.expr.as_ref() {
+                                    // The schema gives us the names, so we can skip aliases
+                                    Expr::Literal(sv) => {
+                                        to_substrait_literal(sv, extensions)
+                                    }
+                                    _ => unreachable!(),
+                                },
+                                _ => unreachable!(),
+                            })
+                            .collect::<Result<_>>()?;
+                        Ok(Struct { fields })
+                    })
+                    .collect::<Result<_>>()?
+            } else {
+                vec![]
+            };
+
+            let expressions = v
                 .values
                 .iter()
                 .map(|row| {
-                    let fields = row
+                    let fields: Vec<Expression> = row
                         .iter()
-                        .map(|v| match v {
-                            Expr::Literal(sv) => to_substrait_literal(sv, extensions),
-                            Expr::Alias(alias) => match alias.expr.as_ref() {
+                        .map(|e| {
+                            match e {
                                 // The schema gives us the names, so we can skip aliases
-                                Expr::Literal(sv) => to_substrait_literal(sv, extensions),
-                                _ => Err(substrait_datafusion_err!(
-                                    "Only literal types can be aliased in Virtual Tables, got: {}", alias.expr.variant_name()
-                                )),
-                            },
-                            _ => Err(substrait_datafusion_err!(
-                                "Only literal types and aliases are supported in Virtual Tables, got: {}", v.variant_name()
-                            )),
+                                Expr::Alias(alias) => to_substrait_rex(ctx, &alias.expr, &v.schema, 0, extensions),
+                                _ => to_substrait_rex(ctx, e, &v.schema, 0, extensions),
+                            }
                         })
                         .collect::<Result<_>>()?;
-                    Ok(Struct { fields })
+                    Ok(substrait::proto::expression::nested::Struct { fields })
                 })
                 .collect::<Result<_>>()?;
+
             Ok(Box::new(Rel {
                 rel_type: Some(RelType::Read(Box::new(ReadRel {
                     common: None,
@@ -275,7 +295,7 @@ pub fn to_substrait_rel(
                     advanced_extension: None,
                     read_type: Some(ReadType::VirtualTable(VirtualTable {
                         values,
-                        expressions: vec![],
+                        expressions,
                     })),
                 }))),
             }))
@@ -1788,6 +1808,19 @@ fn to_substrait_bounds(window_frame: &WindowFrame) -> Result<(Bound, Bound)> {
         to_substrait_bound(&window_frame.start_bound),
         to_substrait_bound(&window_frame.end_bound),
     ))
+}
+
+fn contains_only_literals(v: &Values) -> bool {
+    !v.values.iter().any(|row| {
+        row.iter().any(|v| match v {
+            Expr::Literal(_) => false,
+            Expr::Alias(a) => match a.expr.as_ref() {
+                Expr::Literal(_) => false,
+                _ => true,
+            },
+            _ => true,
+        })
+    })
 }
 
 fn to_substrait_literal(

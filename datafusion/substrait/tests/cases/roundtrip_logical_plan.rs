@@ -23,9 +23,10 @@ use datafusion_substrait::logical_plan::{
     consumer::from_substrait_plan, producer::to_substrait_plan,
 };
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::mem::size_of_val;
 
-use datafusion::arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, Fields, IntervalUnit, Schema, TimeUnit};
 use datafusion::common::{not_impl_err, plan_err, DFSchema, DFSchemaRef};
 use datafusion::error::Result;
 use datafusion::execution::registry::SerializerRegistry;
@@ -898,7 +899,7 @@ async fn roundtrip_values() -> Result<()> {
 async fn roundtrip_values_no_columns() -> Result<()> {
     let ctx = create_context().await?;
     // "VALUES ()" is not yet supported by the SQL parser, so we construct the plan manually
-    let plan = LogicalPlan::Values(Values {
+    let plan: LogicalPlan = LogicalPlan::Values(Values {
         values: vec![vec![], vec![]], // two rows, no columns
         schema: DFSchemaRef::new(DFSchema::empty()),
     });
@@ -909,6 +910,24 @@ async fn roundtrip_values_no_columns() -> Result<()> {
 #[tokio::test]
 async fn roundtrip_values_empty_relation() -> Result<()> {
     roundtrip("SELECT * FROM (VALUES ('a')) LIMIT 0").await
+}
+
+#[tokio::test]
+async fn roundtrip_literal_values() -> Result<()> {
+    roundtrip("SELECT * FROM VALUES (1,2,3)").await
+}
+
+#[tokio::test]
+async fn roundtrip_expression_values() -> Result<()> {
+    DFSchema::from_unqualified_fields(Fields {
+
+    }, HashMap::new())?;
+
+
+    LogicalPlan::Values(Values { schema: Arc::new(Sch), values: () })
+
+
+    roundtrip("SELECT * FROM VALUES ('a' || 'b')").await
 }
 
 #[tokio::test]
@@ -1327,10 +1346,12 @@ async fn roundtrip_logical_plan_with_ctx(
     let plan2 = from_substrait_plan(&ctx, &proto).await?;
     let plan2 = ctx.state().optimize(&plan2)?;
 
-    println!("{plan}");
-    println!("{plan2}");
-
-    println!("{proto:?}");
+    // println!("{plan}");
+    // println!("{plan2}");
+    dbg!(plan.clone());
+    dbg!(plan2.clone());
+    dbg!(proto.clone());
+    // println!("{proto:?}");
 
     let plan1str = format!("{plan}");
     let plan2str = format!("{plan2}");

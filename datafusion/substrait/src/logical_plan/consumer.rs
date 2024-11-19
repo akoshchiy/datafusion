@@ -36,6 +36,7 @@ use datafusion::logical_expr::{
 use substrait::proto::aggregate_rel::Grouping;
 use substrait::proto::expression::subquery::set_predicate::PredicateOp;
 use substrait::proto::expression_reference::ExprType;
+use substrait::proto::read_rel::VirtualTable;
 use url::Url;
 
 use crate::extensions::Extensions;
@@ -887,42 +888,55 @@ pub async fn from_substrait_rel(
                     read_with_schema(t, substrait_schema, &read.projection)
                 }
                 Some(ReadType::VirtualTable(vt)) => {
-                    if vt.values.is_empty() {
+                    let values = from_substrait_virtual_table(
+                        &ctx,
+                        &vt,
+                        named_struct,
+                        &substrait_schema,
+                        extensions,
+                    )
+                    .await?;
+                    if values.is_empty() {
                         return Ok(LogicalPlan::EmptyRelation(EmptyRelation {
                             produce_one_row: false,
                             schema: DFSchemaRef::new(substrait_schema),
                         }));
                     }
+                    // if vt.values.is_empty() && vt.expressions.is_empty() {
+                    //     return Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+                    //         produce_one_row: false,
+                    //         schema: DFSchemaRef::new(substrait_schema),
+                    //     }));
+                    // }
 
-                    let values = vt
-                    .values
-                    .iter()
-                    .map(|row| {
-                        let mut name_idx = 0;
-                        let lits = row
-                            .fields
-                            .iter()
-                            .map(|lit| {
-                                name_idx += 1; // top-level names are provided through schema
-                                Ok(Expr::Literal(from_substrait_literal(
-                                    lit,
-                                    extensions,
-                                    &named_struct.names,
-                                    &mut name_idx,
-                                )?))
-                            })
-                            .collect::<Result<_>>()?;
-                        if name_idx != named_struct.names.len() {
-                            return substrait_err!(
-                                "Names list must match exactly to nested schema, but found {} uses for {} names",
-                                name_idx,
-                                named_struct.names.len()
-                            );
-                        }
-                        Ok(lits)
-                    })
-                    .collect::<Result<_>>()?;
-
+                    // let values = vt
+                    // .values
+                    // .iter()
+                    // .map(|row| {
+                    //     let mut name_idx = 0;
+                    //     let lits = row
+                    //         .fields
+                    //         .iter()
+                    //         .map(|lit| {
+                    //             name_idx += 1; // top-level names are provided through schema
+                    //             Ok(Expr::Literal(from_substrait_literal(
+                    //                 lit,
+                    //                 extensions,
+                    //                 &named_struct.names,
+                    //                 &mut name_idx,
+                    //             )?))
+                    //         })
+                    //         .collect::<Result<_>>()?;
+                    //     if name_idx != named_struct.names.len() {
+                    //         return substrait_err!(
+                    //             "Names list must match exactly to nested schema, but found {} uses for {} names",
+                    //             name_idx,
+                    //             named_struct.names.len()
+                    //         );
+                    //     }
+                    //     Ok(lits)
+                    // })
+                    // .collect::<Result<_>>()?;
                     Ok(LogicalPlan::Values(Values {
                         schema: DFSchemaRef::new(substrait_schema),
                         values,
@@ -2815,6 +2829,57 @@ fn from_substrait_field_reference(
         },
         _ => not_impl_err!("unsupported field ref type"),
     }
+}
+
+#[allow(deprecated)]
+async fn from_substrait_virtual_table(
+    ctx: &SessionContext,
+    vt: &VirtualTable,
+    named_struct: &NamedStruct,
+    input_schema: &DFSchema,
+    extensions: &Extensions,
+) -> Result<Vec<Vec<Expr>>> {
+    if !vt.values.is_empty() {
+        let values: Vec<Vec<Expr>> = vt
+            .values
+            .iter()
+            .map(|row| {
+                let mut name_idx = 0;
+                let lits = row
+                    .fields
+                    .iter()
+                    .map(|lit| {
+                        name_idx += 1; // top-level names are provided through schema
+                        Ok(Expr::Literal(from_substrait_literal(
+                            lit,
+                            extensions,
+                            &named_struct.names,
+                            &mut name_idx,
+                        )?))
+                    })
+                    .collect::<Result<_>>()?;
+                if name_idx != named_struct.names.len() {
+                    return substrait_err!(
+                        "Names list must match exactly to nested schema, but found {} uses for {} names",
+                        name_idx,
+                        named_struct.names.len()
+                    );
+                }
+                Ok(lits)
+            })
+            .collect::<Result<_>>()?;
+        return Ok(values);
+    }
+    let mut expressions = vec![];
+    for row in &vt.expressions {
+        let mut row_exprs = vec![];
+        for field in &row.fields {
+            let expr = from_substrait_rex(ctx, field, input_schema, extensions).await?;
+            row_exprs.push(expr);
+        }
+        expressions.push(row_exprs);
+    }
+    Ok(expressions)
 }
 
 /// Build [`Expr`] from its name and required inputs.
