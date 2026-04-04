@@ -155,12 +155,12 @@ impl WindowFrameContext {
         }
     }
 
-    pub fn calculate_bounds(&mut self, range_columns: &[ArrayRef]) -> Result<()> {
+    pub fn update_comparators(&mut self, range_columns: &[ArrayRef]) -> Result<()> {
         match self {
             WindowFrameContext::Range {
                 window_frame,
                 state,
-            } => state.calculate_bounds(window_frame, range_columns),
+            } => state.update_comparators(window_frame, range_columns),
             _ => Ok(()),
         }
     }
@@ -298,62 +298,28 @@ impl PartitionBatchState {
     }
 }
 
+
 type SharedDynComparator = Arc<dyn Fn(usize, usize) -> std::cmp::Ordering + Send + Sync>;
 
 /// Holds pre-computed comparators for finding RANGE window frame boundaries for all rows in the batch.
 #[derive(Clone)]
-pub struct WindowBoundStateRange {
-    start_bound_comparators: Option<Vec<SharedDynComparator>>,
-    end_bound_comparators: Option<Vec<SharedDynComparator>>,
+struct WindowRangeComparator {
+    comparators: Vec<SharedDynComparator>,
 }
 
-impl std::fmt::Debug for WindowBoundStateRange {
+impl std::fmt::Debug for WindowRangeComparator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WindowBoundStateRange")
-            .field(
-                "start_bound_comparators",
-                &self.start_bound_comparators.as_ref().map(|c| c.len()),
-            )
-            .field(
-                "end_bound_comparators",
-                &self.end_bound_comparators.as_ref().map(|c| c.len()),
-            )
-            .finish()
+        f.debug_struct("WindowRangeComparator").field("comparators", &self.comparators.len()).finish()
     }
 }
 
-impl WindowBoundStateRange {
-    pub fn try_new(
-        window_frame: &Arc<WindowFrame>,
-        range_columns: &[ArrayRef],
-        sort_options: &[SortOptions],
-    ) -> Result<Self> {
-        let sort_descending = sort_options.first().map(|o| o.descending).unwrap_or(false);
-
-        let start_bound_comparators = Self::build_bound_comparators(
-            &window_frame.start_bound,
-            range_columns,
-            sort_options,
-            sort_descending,
-        )?;
-        let end_bound_comparators = Self::build_bound_comparators(
-            &window_frame.end_bound,
-            range_columns,
-            sort_options,
-            sort_descending,
-        )?;
-        Ok(Self {
-            start_bound_comparators,
-            end_bound_comparators,
-        })
-    }
-
-    fn build_bound_comparators(
+impl WindowRangeComparator {
+    fn try_build(
         bound: &WindowFrameBound,
         range_columns: &[ArrayRef],
         sort_options: &[SortOptions],
-        sort_descending: bool,
-    ) -> Result<Option<Vec<SharedDynComparator>>> {
+    ) -> Result<Option<Self>> {
+        let sort_descending = sort_options.first().map(|o| o.descending).unwrap_or(false);
         match bound {
             WindowFrameBound::Preceding(delta) if delta.is_null() => {
                 // UNBOUNDED PRECEDING
@@ -364,7 +330,7 @@ impl WindowBoundStateRange {
                 Ok(None)
             }
             WindowFrameBound::Preceding(delta) => {
-                let comparators = Self::build_comparators(
+                let comparators = Self::build_comparator(
                     range_columns,
                     Some(delta),
                     true,
@@ -374,7 +340,7 @@ impl WindowBoundStateRange {
                 Ok(Some(comparators))
             }
             WindowFrameBound::Following(delta) => {
-                let comparators = Self::build_comparators(
+                let comparators = Self::build_comparator(
                     range_columns,
                     Some(delta),
                     false,
@@ -384,7 +350,7 @@ impl WindowBoundStateRange {
                 Ok(Some(comparators))
             }
             WindowFrameBound::CurrentRow => {
-                let comparators = Self::build_comparators(
+                let comparators = Self::build_comparator(
                     range_columns,
                     None,
                     false,
@@ -396,13 +362,13 @@ impl WindowBoundStateRange {
         }
     }
 
-    fn build_comparators(
+    fn build_comparator(
         range_columns: &[ArrayRef],
         delta: Option<&ScalarValue>,
         preceding: bool,
         sort_descending: bool,
         sort_options: &[SortOptions],
-    ) -> Result<Vec<SharedDynComparator>> {
+    ) -> Result<Self> {
         let mut comparators: Vec<SharedDynComparator> =
             Vec::with_capacity(range_columns.len());
         for (col, opt) in range_columns.iter().zip(sort_options.iter()) {
@@ -418,7 +384,7 @@ impl WindowBoundStateRange {
 
             comparators.push(Arc::from(cmp));
         }
-        Ok(comparators)
+        Ok(WindowRangeComparator { comparators })
     }
 
     /// Computes array for a given bound.
@@ -443,6 +409,16 @@ impl WindowBoundStateRange {
         };
         result.map_err(|e| internal_datafusion_err!("Failed to compute bound array: {e}"))
     }
+
+    fn compare(&self, search_idx: usize, current_idx: usize) -> std::cmp::Ordering {
+        for comparator in &self.comparators {
+            let cmp = comparator(search_idx, current_idx);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
 }
 
 /// This structure encapsulates all the state information we require as we scan
@@ -452,7 +428,8 @@ impl WindowBoundStateRange {
 #[derive(Debug, Default, Clone)]
 pub struct WindowFrameStateRange {
     sort_options: Vec<SortOptions>,
-    bound_state: Option<WindowBoundStateRange>,
+    start_bound_comparator: Option<WindowRangeComparator>,
+    end_bound_comparator: Option<WindowRangeComparator>,
 }
 
 impl WindowFrameStateRange {
@@ -460,21 +437,18 @@ impl WindowFrameStateRange {
     fn new(sort_options: Vec<SortOptions>) -> Self {
         Self {
             sort_options,
-            bound_state: None,
+            start_bound_comparator: None,
+            end_bound_comparator: None,
         }
     }
 
-    fn calculate_bounds(
+    fn update_comparators(
         &mut self,
         window_frame: &Arc<WindowFrame>,
         range_columns: &[ArrayRef],
     ) -> Result<()> {
-        let bound_state = WindowBoundStateRange::try_new(
-            window_frame,
-            range_columns,
-            &self.sort_options,
-        )?;
-        self.bound_state = Some(bound_state);
+        self.start_bound_comparator = WindowRangeComparator::try_build(&window_frame.start_bound, range_columns, &self.sort_options)?;
+        self.end_bound_comparator = WindowRangeComparator::try_build(&window_frame.end_bound, range_columns, &self.sort_options)?;
         Ok(())
     }
 
@@ -485,23 +459,19 @@ impl WindowFrameStateRange {
         length: usize,
         idx: usize,
     ) -> Result<Range<usize>> {
-        let bound_state = self.bound_state.as_ref().ok_or_else(|| {
-            internal_datafusion_err!("Missing precalculated WindowBoundStateRange")
-        })?;
-
         let start = match window_frame.start_bound {
             WindowFrameBound::Preceding(ref n) if n.is_null() => 0,
             WindowFrameBound::Preceding(_)
             | WindowFrameBound::CurrentRow
             | WindowFrameBound::Following(_) => {
-                let comparators = bound_state
-                    .start_bound_comparators
+                let comparator = self
+                    .start_bound_comparator
                     .as_ref()
                     .ok_or_else(|| {
-                        internal_datafusion_err!("Missing start_bound comparators")
+                        internal_datafusion_err!("Missing start_bound comparator")
                     })?;
                 self.search_index_of_row::<true>(
-                    comparators,
+                    comparator,
                     last_range.start,
                     length,
                     idx,
@@ -514,12 +484,14 @@ impl WindowFrameStateRange {
             WindowFrameBound::Preceding(_)
             | WindowFrameBound::CurrentRow
             | WindowFrameBound::Following(_) => {
-                let comparators =
-                    bound_state.end_bound_comparators.as_ref().ok_or_else(|| {
-                        internal_datafusion_err!("Missing end_bound comparators")
+                let comparator = self
+                    .end_bound_comparator
+                    .as_ref()
+                    .ok_or_else(|| {
+                        internal_datafusion_err!("Missing end_bound comparator")
                     })?;
                 self.search_index_of_row::<false>(
-                    comparators,
+                    comparator,
                     last_range.end,
                     length,
                     idx,
@@ -531,13 +503,13 @@ impl WindowFrameStateRange {
 
     fn search_index_of_row<const SIDE: bool>(
         &self,
-        comparators: &[SharedDynComparator],
+        comparator: &WindowRangeComparator,
         mut search_start: usize,
         length: usize,
         current_idx: usize,
     ) -> usize {
         while search_start < length {
-            let cmp = self.compare_indexes(comparators, search_start, current_idx);
+            let cmp = comparator.compare(search_start, current_idx);
             let stop = if SIDE { !cmp.is_lt() } else { !cmp.is_le() };
             if stop {
                 break;
@@ -545,21 +517,6 @@ impl WindowFrameStateRange {
             search_start += 1;
         }
         search_start
-    }
-
-    fn compare_indexes(
-        &self,
-        comparators: &[SharedDynComparator],
-        search_idx: usize,
-        current_idx: usize,
-    ) -> std::cmp::Ordering {
-        for comparator in comparators {
-            let cmp = comparator(search_idx, current_idx);
-            if cmp != std::cmp::Ordering::Equal {
-                return cmp;
-            }
-        }
-        std::cmp::Ordering::Equal
     }
 }
 
@@ -839,7 +796,7 @@ mod tests {
         let (range_columns, _) = get_test_data();
         let n_row = range_columns[0].len();
         let mut last_range = Range { start: 0, end: 0 };
-        window_frame_context.calculate_bounds(&range_columns)?;
+        window_frame_context.update_comparators(&range_columns)?;
         for (idx, expected_range) in expected_results.into_iter().enumerate() {
             let range = window_frame_context.calculate_range(
                 &range_columns,

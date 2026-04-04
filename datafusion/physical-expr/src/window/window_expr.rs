@@ -336,7 +336,7 @@ pub trait AggregateWindowExpr: WindowExpr {
         let mut row_wise_results: Vec<ScalarValue> = vec![];
         let is_causal = self.get_window_frame().is_causal();
 
-        window_frame_ctx.calculate_bounds(&order_bys)?;
+        window_frame_ctx.update_comparators(&order_bys)?;
 
         while idx < length {
             // Start search from the last_range. This squeezes searched range.

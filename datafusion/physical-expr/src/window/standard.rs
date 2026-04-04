@@ -129,7 +129,7 @@ impl WindowExpr for StandardWindowExpr {
                 WindowFrameContext::new(Arc::clone(&self.window_frame), sort_options);
             let mut last_range = Range { start: 0, end: 0 };
 
-            window_frame_ctx.calculate_bounds(order_bys_ref)?;
+            window_frame_ctx.update_comparators(order_bys_ref)?;
 
             // We iterate on each row to calculate window frame range and and window function result
             for idx in 0..num_rows {
@@ -216,7 +216,7 @@ impl WindowExpr for StandardWindowExpr {
                             sort_options.clone(),
                         )
                     })
-                    .calculate_bounds(order_bys_ref)?;
+                    .update_comparators(order_bys_ref)?;
             }
 
             for idx in state.last_calculated_index..num_rows {
