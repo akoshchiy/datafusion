@@ -22,12 +22,12 @@ use std::{collections::VecDeque, ops::Range, sync::Arc};
 use crate::{WindowFrame, WindowFrameBound, WindowFrameUnits};
 
 use arrow::{
-    array::{ArrayRef, make_comparator},
+    array::{ArrayRef, AsArray, PrimitiveArray, make_comparator},
     compute::{
         SortOptions, concat, concat_batches,
         kernels::numeric::{add_wrapping, sub_wrapping},
     },
-    datatypes::{DataType, SchemaRef},
+    datatypes::{DataType, SchemaRef, UInt8Type, UInt16Type, UInt32Type, UInt64Type},
     record_batch::RecordBatch,
 };
 use datafusion_common::{
@@ -298,7 +298,6 @@ impl PartitionBatchState {
     }
 }
 
-
 type SharedDynComparator = Arc<dyn Fn(usize, usize) -> std::cmp::Ordering + Send + Sync>;
 
 /// Holds pre-computed comparators for finding RANGE window frame boundaries for all rows in the batch.
@@ -309,7 +308,9 @@ struct WindowRangeComparator {
 
 impl std::fmt::Debug for WindowRangeComparator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WindowRangeComparator").field("comparators", &self.comparators.len()).finish()
+        f.debug_struct("WindowRangeComparator")
+            .field("comparators", &self.comparators.len())
+            .finish()
     }
 }
 
@@ -388,9 +389,9 @@ impl WindowRangeComparator {
     }
 
     /// Computes array for a given bound.
-    /// For PRECEDING with descending=false: bound = value + delta
-    /// For PRECEDING with descending=true: bound = value - delta
-    /// For FOLLOWING with descending=false: bound = value + delta  
+    /// For PRECEDING with descending=false: bound = value - delta
+    /// For PRECEDING with descending=true: bound = value + delta
+    /// For FOLLOWING with descending=false: bound = value + delta
     /// For FOLLOWING with descending=true: bound = value - delta
     fn compute_bound_array(
         range_column: &ArrayRef,
@@ -405,9 +406,89 @@ impl WindowRangeComparator {
         let result = if add {
             add_wrapping(range_column, &delta_scalar)
         } else {
-            sub_wrapping(range_column, &delta_scalar)
+            if let Some(result) = Self::saturating_sub_unsigned_array(range_column, delta)
+            {
+                Ok(result)
+            } else {
+                sub_wrapping(range_column, &delta_scalar)
+            }
         };
         result.map_err(|e| internal_datafusion_err!("Failed to compute bound array: {e}"))
+    }
+
+    fn saturating_sub_unsigned_array(
+        range_column: &ArrayRef,
+        delta: &ScalarValue,
+    ) -> Option<ArrayRef> {
+        match (range_column.data_type(), delta) {
+            (DataType::UInt8, ScalarValue::UInt8(Some(delta))) => {
+                let result: PrimitiveArray<UInt8Type> = range_column
+                    .as_primitive::<UInt8Type>()
+                    .unary(|value| value.saturating_sub(*delta));
+                Some(Arc::new(result))
+            }
+            (DataType::UInt16, ScalarValue::UInt16(Some(delta))) => {
+                let result: PrimitiveArray<UInt16Type> = range_column
+                    .as_primitive::<UInt16Type>()
+                    .unary(|value| value.saturating_sub(*delta));
+                Some(Arc::new(result))
+            }
+            (DataType::UInt16, ScalarValue::UInt8(Some(delta))) => {
+                let delta = *delta as u16;
+                let result: PrimitiveArray<UInt16Type> = range_column
+                    .as_primitive::<UInt16Type>()
+                    .unary(|value| value.saturating_sub(delta));
+                Some(Arc::new(result))
+            }
+            (DataType::UInt32, ScalarValue::UInt32(Some(delta))) => {
+                let result: PrimitiveArray<UInt32Type> = range_column
+                    .as_primitive::<UInt32Type>()
+                    .unary(|value| value.saturating_sub(*delta));
+                Some(Arc::new(result))
+            }
+            (DataType::UInt32, ScalarValue::UInt16(Some(delta))) => {
+                let delta = *delta as u32;
+                let result: PrimitiveArray<UInt32Type> = range_column
+                    .as_primitive::<UInt32Type>()
+                    .unary(|value| value.saturating_sub(delta));
+                Some(Arc::new(result))
+            }
+            (DataType::UInt32, ScalarValue::UInt8(Some(delta))) => {
+                let delta = *delta as u32;
+                let result: PrimitiveArray<UInt32Type> = range_column
+                    .as_primitive::<UInt32Type>()
+                    .unary(|value| value.saturating_sub(delta));
+                Some(Arc::new(result))
+            }
+            (DataType::UInt64, ScalarValue::UInt64(Some(delta))) => {
+                let result: PrimitiveArray<UInt64Type> = range_column
+                    .as_primitive::<UInt64Type>()
+                    .unary(|value| value.saturating_sub(*delta));
+                Some(Arc::new(result))
+            }
+            (DataType::UInt64, ScalarValue::UInt32(Some(delta))) => {
+                let delta = *delta as u64;
+                let result: PrimitiveArray<UInt64Type> = range_column
+                    .as_primitive::<UInt64Type>()
+                    .unary(|value| value.saturating_sub(delta));
+                Some(Arc::new(result))
+            }
+            (DataType::UInt64, ScalarValue::UInt16(Some(delta))) => {
+                let delta = *delta as u64;
+                let result: PrimitiveArray<UInt64Type> = range_column
+                    .as_primitive::<UInt64Type>()
+                    .unary(|value| value.saturating_sub(delta));
+                Some(Arc::new(result))
+            }
+            (DataType::UInt64, ScalarValue::UInt8(Some(delta))) => {
+                let delta = *delta as u64;
+                let result: PrimitiveArray<UInt64Type> = range_column
+                    .as_primitive::<UInt64Type>()
+                    .unary(|value| value.saturating_sub(delta));
+                Some(Arc::new(result))
+            }
+            _ => None,
+        }
     }
 
     fn compare(&self, search_idx: usize, current_idx: usize) -> std::cmp::Ordering {
@@ -447,8 +528,16 @@ impl WindowFrameStateRange {
         window_frame: &Arc<WindowFrame>,
         range_columns: &[ArrayRef],
     ) -> Result<()> {
-        self.start_bound_comparator = WindowRangeComparator::try_build(&window_frame.start_bound, range_columns, &self.sort_options)?;
-        self.end_bound_comparator = WindowRangeComparator::try_build(&window_frame.end_bound, range_columns, &self.sort_options)?;
+        self.start_bound_comparator = WindowRangeComparator::try_build(
+            &window_frame.start_bound,
+            range_columns,
+            &self.sort_options,
+        )?;
+        self.end_bound_comparator = WindowRangeComparator::try_build(
+            &window_frame.end_bound,
+            range_columns,
+            &self.sort_options,
+        )?;
         Ok(())
     }
 
@@ -464,10 +553,8 @@ impl WindowFrameStateRange {
             WindowFrameBound::Preceding(_)
             | WindowFrameBound::CurrentRow
             | WindowFrameBound::Following(_) => {
-                let comparator = self
-                    .start_bound_comparator
-                    .as_ref()
-                    .ok_or_else(|| {
+                let comparator =
+                    self.start_bound_comparator.as_ref().ok_or_else(|| {
                         internal_datafusion_err!("Missing start_bound comparator")
                     })?;
                 self.search_index_of_row::<true>(
@@ -484,18 +571,10 @@ impl WindowFrameStateRange {
             WindowFrameBound::Preceding(_)
             | WindowFrameBound::CurrentRow
             | WindowFrameBound::Following(_) => {
-                let comparator = self
-                    .end_bound_comparator
-                    .as_ref()
-                    .ok_or_else(|| {
-                        internal_datafusion_err!("Missing end_bound comparator")
-                    })?;
-                self.search_index_of_row::<false>(
-                    comparator,
-                    last_range.end,
-                    length,
-                    idx,
-                )
+                let comparator = self.end_bound_comparator.as_ref().ok_or_else(|| {
+                    internal_datafusion_err!("Missing end_bound comparator")
+                })?;
+                self.search_index_of_row::<false>(comparator, last_range.end, length, idx)
             }
         };
         Ok(Range { start, end })
