@@ -155,6 +155,11 @@ impl WindowFrameContext {
         }
     }
 
+    /// Refreshes any cached frame comparators for the current batch.
+    ///
+    /// This is a no-op for `ROWS` and `GROUPS` frames. For `RANGE` frames,
+    /// callers should invoke this before `calculate_range` when the ORDER BY
+    /// columns change, such as when evaluating a new batch or partition.
     pub fn update_comparators(&mut self, range_columns: &[ArrayRef]) -> Result<()> {
         match self {
             WindowFrameContext::Range {
@@ -506,6 +511,7 @@ impl WindowRangeComparator {
 /// ranges of data while processing RANGE frames.
 /// Attribute `sort_options` stores the column ordering specified by the ORDER
 /// BY clause. This information is used to calculate the range.
+/// Attributes `start_bound_comparator` and `end_bound_comparator` store the cached comparators for calculating ranges.
 #[derive(Debug, Default, Clone)]
 pub struct WindowFrameStateRange {
     sort_options: Vec<SortOptions>,
