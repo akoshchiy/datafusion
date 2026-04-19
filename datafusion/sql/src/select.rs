@@ -479,12 +479,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     expr,
                 )?;
 
-                if let Some(public_columns) =
+                if let Some(columns) =
                     self.get_struct_unnest_columns(&intermediate_plan, expr)?
                 {
                     rewritten_exprs = rewritten_exprs
                         .into_iter()
-                        .zip(public_columns)
+                        .zip(columns)
                         .map(|(expr, column)| expr.alias(column.flat_name()))
                         .collect();
                 }
