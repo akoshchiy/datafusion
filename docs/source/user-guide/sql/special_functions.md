@@ -69,7 +69,7 @@ Expands an array or map into rows.
 ### `unnest (struct)`
 
 Expand a struct fields into individual columns.
-Each field of the struct could be accessed via `"<table>.<struct>.<field>"`.
+Each field of the struct can be accessed via `"<table>.<struct>.<field>"`.
 
 #### Arguments
 
